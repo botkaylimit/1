@@ -1,0 +1,449 @@
+-- Chilli Finder Clone - Steal an Egg High-Value Pet Scanner & Server Hopper
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local CoreGui = game:GetService("CoreGui")
+local LocalPlayer = Players.LocalPlayer
+local PlaceId = game.PlaceId
+local CurrentJobId = game.JobId
+
+-- Cấu hình mặc định
+local Config = {
+    AutoScanHop = false,
+    ForceJoin = false,
+    MinValueIndex = 1,
+    RarityIndex = 1,
+    CustomApiUrl = "", -- Điền URL API / Webhook riêng nếu bạn có nhiều acc phụ cùng quét đẩy data về
+}
+
+local MinValues = {
+    {Label = "100M/s", Val = 1e8},
+    {Label = "1B/s",   Val = 1e9},
+    {Label = "5B/s",   Val = 5e9},
+    {Label = "10B/s",  Val = 1e10},
+    {Label = "25B/s",  Val = 2.5e10},
+    {Label = "50B/s",  Val = 5e10}
+}
+
+local Rarities = {"Any", "Golden", "Rainbow", "Divine", "Eternal", "Mythical"}
+local DiscoveredServers = {}
+
+-- Hàm chuyển đổi chuỗi tiền tệ (VD: "$29.22B/s" -> 29220000000)
+local function ParseCurrency(str)
+    if type(str) == "number" then return str end
+    if type(str) ~= "string" then return 0 end
+    local clean = str:upper():gsub("[,%$%s/S]", "")
+    local num, suffix = clean:match("([%d%.]+)([KMBTQaQi]*)")
+    num = tonumber(num)
+    if not num then return 0 end
+    local mult = {
+        K = 1e3, M = 1e6, B = 1e9, T = 1e12, QA = 1e15, QI = 1e18
+    }
+    return num * (mult[suffix] or 1)
+end
+
+-- Hàm định dạng số thành chuỗi hiển thị
+local function FormatCurrency(val)
+    if val >= 1e12 then return string.format("$%.2fT/s", val / 1e12)
+    elseif val >= 1e9 then return string.format("$%.2fB/s", val / 1e9)
+    elseif val >= 1e6 then return string.format("$%.2fM/s", val / 1e6)
+    elseif val >= 1e3 then return string.format("$%.2fK/s", val / 1e3)
+    else return string.format("$%d/s", val) end
+end
+
+-- Quét toàn bộ Workspace tìm Pet / Egg có giá trị $/s cao nhất trong Server
+local function ScanCurrentServer()
+    local results = {}
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("Model") or obj:IsA("BasePart") or obj:IsA("Folder") then
+            -- Kiểm tra Attributes hoặc ValueObjects hoặc BillboardGui
+            local valPerSec = obj:GetAttribute("Value") or obj:GetAttribute("Income") or obj:GetAttribute("MoneyPerSecond") or obj:GetAttribute("CashPerSec")
+            local petName = obj:GetAttribute("PetName") or obj:GetAttribute("EggName") or obj.Name
+            local mutation = obj:GetAttribute("Mutation") or obj:GetAttribute("Rarity") or ""
+            local sizeMult = obj:GetAttribute("Size") or obj:GetAttribute("Multiplier") or 1
+
+            -- Nếu game hiển thị qua BillboardGui trên đầu Pet/Egg
+            if not valPerSec then
+                local gui = obj:FindFirstChildWhichIsA("BillboardGui", true)
+                if gui then
+                    for _, lbl in ipairs(gui:GetDescendants()) do
+                        if lbl:IsA("TextLabel") then
+                            local txt = lbl.Text
+                            if txt:find("/s") or txt:find("%$") then
+                                local parsed = ParseCurrency(txt)
+                                if parsed > (valPerSec or 0) then
+                                    valPerSec = parsed
+                                end
+                            elseif txt:find("^x[%d%.]+") then
+                                sizeMult = tonumber(txt:match("x([%d%.]+)")) or sizeMult
+                            elseif txt == "Golden" or txt == "Rainbow" or txt == "Divine" or txt == "Eternal" then
+                                mutation = txt
+                            elseif #txt > 2 and not txt:find("%d") then
+                                petName = txt
+                            end
+                        end
+                    end
+                end
+            else
+                valPerSec = ParseCurrency(valPerSec)
+            end
+
+            if valPerSec and valPerSec > 0 then
+                table.insert(results, {
+                    Name = tostring(petName),
+                    Value = valPerSec,
+                    Mutation = tostring(mutation),
+                    Multiplier = tonumber(sizeMult) or 1,
+                    JobId = CurrentJobId,
+                    Timestamp = os.time(),
+                    Instance = obj
+                })
+            end
+        end
+    end
+
+    table.sort(results, function(a, b) return a.Value > b.Value end)
+    return results
+end
+
+-- Xóa UI cũ nếu đã chạy trước đó
+if CoreGui:FindFirstChild("ChilliFinderUI") then
+    CoreGui.ChilliFinderUI:Destroy()
+end
+
+-- Khởi tạo Giao diện Chilli Finder
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "ChilliFinderUI"
+ScreenGui.Parent = CoreGui
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Parent = ScreenGui
+MainFrame.BackgroundColor3 = Color3.fromRGB(38, 39, 46)
+MainFrame.BorderSizePixel = 0
+MainFrame.Position = UDim2.new(0.5, -180, 0.5, -220)
+MainFrame.Size = UDim2.new(0, 360, 0, 440)
+MainFrame.Active = true
+MainFrame.Draggable = true
+
+local MainStroke = Instance.new("UIStroke", MainFrame)
+MainStroke.Color = Color3.fromRGB(20, 20, 25)
+MainStroke.Thickness = 3
+
+local MainCorner = Instance.new("UICorner", MainFrame)
+MainCorner.CornerRadius = UDim.new(0, 6)
+
+-- Header cam
+local Header = Instance.new("Frame", MainFrame)
+Header.BackgroundColor3 = Color3.fromRGB(255, 115, 15)
+Header.Size = UDim2.new(1, 0, 0, 52)
+Header.BorderSizePixel = 0
+
+local HeaderCorner = Instance.new("UICorner", Header)
+HeaderCorner.CornerRadius = UDim.new(0, 6)
+
+local HeaderGradient = Instance.new("UIGradient", Header)
+HeaderGradient.Color = ColorSequence.new{
+    ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 145, 0)),
+    ColorSequenceKeypoint.new(1, Color3.fromRGB(215, 65, 0))
+}
+HeaderGradient.Rotation = 90
+
+local TitleLabel = Instance.new("TextLabel", Header)
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Position = UDim2.new(0, 12, 0, 0)
+TitleLabel.Size = UDim2.new(0, 180, 1, 0)
+TitleLabel.Font = Enum.Font.FredokaOne
+TitleLabel.Text = "Chilli Finder"
+TitleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+TitleLabel.TextSize = 24
+TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local TitleStroke = Instance.new("UIStroke", TitleLabel)
+TitleStroke.Color = Color3.fromRGB(0, 0, 0)
+TitleStroke.Thickness = 2
+
+-- Nút Scan (Icon bánh răng)
+local ScanNowBtn = Instance.new("TextButton", Header)
+ScanNowBtn.BackgroundColor3 = Color3.fromRGB(70, 130, 180)
+ScanNowBtn.Position = UDim2.new(1, -135, 0.5, -16)
+ScanNowBtn.Size = UDim2.new(0, 32, 0, 32)
+ScanNowBtn.Font = Enum.Font.FredokaOne
+ScanNowBtn.Text = "⚙"
+ScanNowBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+ScanNowBtn.TextSize = 18
+Instance.new("UICorner", ScanNowBtn).CornerRadius = UDim.new(0, 6)
+Instance.new("UIStroke", ScanNowBtn).Thickness = 1.5
+
+-- Nút AUTO OFF / ON
+local AutoBtn = Instance.new("TextButton", Header)
+AutoBtn.BackgroundColor3 = Color3.fromRGB(90, 98, 110)
+AutoBtn.Position = UDim2.new(1, -96, 0.5, -16)
+AutoBtn.Size = UDim2.new(0, 86, 0, 32)
+AutoBtn.Font = Enum.Font.FredokaOne
+AutoBtn.Text = "AUTO OFF"
+AutoBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+AutoBtn.TextSize = 14
+Instance.new("UICorner", AutoBtn).CornerRadius = UDim.new(0, 6)
+Instance.new("UIStroke", AutoBtn).Thickness = 1.5
+
+-- Hàng 4 nút điều khiển
+local FilterBar = Instance.new("Frame", MainFrame)
+FilterBar.BackgroundTransparency = 1
+FilterBar.Position = UDim2.new(0, 10, 0, 62)
+FilterBar.Size = UDim2.new(1, -20, 0, 46)
+
+local FilterLayout = Instance.new("UIListLayout", FilterBar)
+FilterLayout.FillDirection = Enum.FillDirection.Horizontal
+FilterLayout.Padding = UDim.new(0, 6)
+FilterLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+local function CreateTopBtn(title, sub, bgColor, order)
+    local btn = Instance.new("TextButton", FilterBar)
+    btn.LayoutOrder = order
+    btn.BackgroundColor3 = bgColor
+    btn.Size = UDim2.new(0.25, -5, 1, 0)
+    btn.Text = ""
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 5)
+    local st = Instance.new("UIStroke", btn)
+    st.Color = Color3.fromRGB(20, 20, 20)
+    st.Thickness = 1.5
+
+    local tLbl = Instance.new("TextLabel", btn)
+    tLbl.BackgroundTransparency = 1
+    tLbl.Position = UDim2.new(0, 0, 0, 4)
+    tLbl.Size = UDim2.new(1, 0, 0, 16)
+    tLbl.Font = Enum.Font.FredokaOne
+    tLbl.Text = title
+    tLbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+    tLbl.TextSize = 11
+    Instance.new("UIStroke", tLbl).Thickness = 1
+
+    local sLbl = Instance.new("TextLabel", btn)
+    sLbl.BackgroundTransparency = 1
+    sLbl.Position = UDim2.new(0, 0, 0, 20)
+    sLbl.Size = UDim2.new(1, 0, 0, 22)
+    sLbl.Font = Enum.Font.FredokaOne
+    sLbl.Text = sub
+    sLbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+    sLbl.TextSize = 15
+    Instance.new("UIStroke", sLbl).Thickness = 1.5
+
+    return btn, sLbl
+end
+
+local ForceJoinBtn, ForceJoinSub = CreateTopBtn("FORCE JOIN", "OFF", Color3.fromRGB(65, 175, 55), 1)
+local MinValBtn, MinValSub       = CreateTopBtn("MIN VALUE", MinValues[Config.MinValueIndex].Label, Color3.fromRGB(55, 145, 220), 2)
+local RarityBtn, RaritySub       = CreateTopBtn("RARITY", Rarities[Config.RarityIndex], Color3.fromRGB(55, 145, 220), 3)
+local AccountBtn, AccountSub     = CreateTopBtn("ACCOUNT", "Free Tier", Color3.fromRGB(235, 175, 20), 4)
+
+-- Dòng trạng thái
+local StatusLabel = Instance.new("TextLabel", MainFrame)
+StatusLabel.BackgroundTransparency = 1
+StatusLabel.Position = UDim2.new(0, 10, 0, 112)
+StatusLabel.Size = UDim2.new(1, -20, 0, 20)
+StatusLabel.Font = Enum.Font.GothamBold
+StatusLabel.Text = "Hi " .. LocalPlayer.Name .. ", scanner active & ready."
+StatusLabel.TextColor3 = Color3.fromRGB(230, 230, 230)
+StatusLabel.TextSize = 11
+
+-- Danh sách cuộn chứa các Pet tìm được
+local ListScroll = Instance.new("ScrollingFrame", MainFrame)
+ListScroll.BackgroundTransparency = 1
+ListScroll.Position = UDim2.new(0, 10, 0, 136)
+ListScroll.Size = UDim2.new(1, -20, 1, -146)
+ListScroll.CanvasSize = UDim2.new(0, 0, 0, 0)
+ListScroll.ScrollBarThickness = 4
+ListScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+
+local ListLayout = Instance.new("UIListLayout", ListScroll)
+ListLayout.Padding = UDim.new(0, 6)
+ListLayout.SortOrder = Enum.SortOrder.LayoutOrder
+
+-- Hàm vẽ từng dòng Pet giống hệt ảnh
+local function RenderPetList()
+    for _, child in ipairs(ListScroll:GetChildren()) do
+        if child:IsA("Frame") then child:Destroy() end
+    end
+
+    local minAllowed = MinValues[Config.MinValueIndex].Val
+    local reqRarity = Rarities[Config.RarityIndex]
+
+    for idx, item in ipairs(DiscoveredServers) do
+        local passValue = item.Value >= minAllowed
+        local passRarity = (reqRarity == "Any") or (item.Mutation:lower() == reqRarity:lower())
+
+        if passValue and passRarity then
+            local Row = Instance.new("Frame", ListScroll)
+            Row.BackgroundColor3 = Color3.fromRGB(62, 64, 72)
+            Row.Size = UDim2.new(1, -4, 0, 54)
+            Row.LayoutOrder = idx
+            Instance.new("UICorner", Row).CornerRadius = UDim.new(0, 5)
+            local rStroke = Instance.new("UIStroke", Row)
+            rStroke.Color = Color3.fromRGB(25, 25, 30)
+            rStroke.Thickness = 1.5
+
+            -- Khung Avatar Pet
+            local IconBox = Instance.new("Frame", Row)
+            IconBox.BackgroundColor3 = Color3.fromRGB(48, 50, 56)
+            IconBox.Position = UDim2.new(0, 4, 0, 4)
+            IconBox.Size = UDim2.new(0, 46, 0, 46)
+            Instance.new("UICorner", IconBox).CornerRadius = UDim.new(0, 4)
+
+            local MutLabel = Instance.new("TextLabel", IconBox)
+            MutLabel.BackgroundTransparency = 1
+            MutLabel.Position = UDim2.new(0, 0, 1, -14)
+            MutLabel.Size = UDim2.new(1, 0, 0, 14)
+            MutLabel.Font = Enum.Font.FredokaOne
+            MutLabel.Text = item.Mutation ~= "" and item.Mutation or "Normal"
+            MutLabel.TextColor3 = item.Mutation == "Rainbow" and Color3.fromRGB(255, 120, 255)
+                or (item.Mutation == "Golden" and Color3.fromRGB(255, 215, 50) or Color3.fromRGB(200, 200, 200))
+            MutLabel.TextSize = 11
+            Instance.new("UIStroke", MutLabel).Thickness = 1
+
+            -- Tên Pet
+            local NameLbl = Instance.new("TextLabel", Row)
+            NameLbl.BackgroundTransparency = 1
+            NameLbl.Position = UDim2.new(0, 58, 0, 5)
+            NameLbl.Size = UDim2.new(0, 180, 0, 22)
+            NameLbl.Font = Enum.Font.FredokaOne
+            NameLbl.Text = item.Name
+            NameLbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+            NameLbl.TextSize = 18
+            NameLbl.TextXAlignment = Enum.TextXAlignment.Left
+            Instance.new("UIStroke", NameLbl).Thickness = 1.5
+
+            -- Giá tiền + Hệ số nhân + Thời gian
+            local InfoLbl = Instance.new("TextLabel", Row)
+            InfoLbl.BackgroundTransparency = 1
+            InfoLbl.Position = UDim2.new(0, 58, 0, 28)
+            InfoLbl.Size = UDim2.new(0, 200, 0, 20)
+            InfoLbl.Font = Enum.Font.GothamBold
+            InfoLbl.RichText = true
+            local diffSec = math.max(0, os.time() - item.Timestamp)
+            local timeStr = diffSec < 60 and (diffSec .. "s ago") or (math.floor(diffSec / 60) .. "m ago")
+            InfoLbl.Text = string.format(
+                '<font color="#55FF55">%s</font>  <font color="#FFCC33">x%.2f</font>  <font color="#CCCCCC">%s</font>',
+                FormatCurrency(item.Value), item.Multiplier, timeStr
+            )
+            InfoLbl.TextSize = 12
+            InfoLbl.TextXAlignment = Enum.TextXAlignment.Left
+
+            -- Nút Join / Teleport
+            local JoinBtn = Instance.new("TextButton", Row)
+            JoinBtn.BackgroundColor3 = Color3.fromRGB(245, 185, 15)
+            JoinBtn.Position = UDim2.new(1, -78, 0.5, -18)
+            JoinBtn.Size = UDim2.new(0, 70, 0, 36)
+            JoinBtn.Font = Enum.Font.FredokaOne
+            JoinBtn.Text = (item.JobId == CurrentJobId) and "Grab" or "Join"
+            JoinBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+            JoinBtn.TextSize = 17
+            Instance.new("UICorner", JoinBtn).CornerRadius = UDim.new(0, 5)
+            Instance.new("UIStroke", JoinBtn).Thickness = 1.5
+
+            JoinBtn.MouseButton1Click:Connect(function()
+                if item.JobId == CurrentJobId and item.Instance then
+                    -- Dịch chuyển tới tận nơi Pet/Egg trong cùng server
+                    local char = LocalPlayer.Character
+                    local targetPos = item.Instance:GetPivot().Position
+                    if char and char:FindFirstChild("HumanoidRootPart") then
+                        char.HumanoidRootPart.CFrame = CFrame.new(targetPos + Vector3.new(0, 4, 0))
+                    end
+                else
+                    -- Nhảy sang server chứa Pet đó
+                    TeleportService:TeleportToPlaceInstance(PlaceId, item.JobId, LocalPlayer)
+                end
+            end)
+        end
+    end
+end
+
+-- Cập nhật kết quả quét mới
+local function RefreshScan()
+    local found = ScanCurrentServer()
+    for _, pet in ipairs(found) do
+        table.insert(DiscoveredServers, 1, pet)
+    end
+    -- Giữ tối đa 30 kết quả cao nhất
+    table.sort(DiscoveredServers, function(a, b) return a.Value > b.Value end)
+    while #DiscoveredServers > 30 do
+        table.remove(DiscoveredServers)
+    end
+    RenderPetList()
+
+    -- Nếu bật Force Join và tìm thấy Pet vượt ngưỡng trong danh sách khác server
+    if Config.ForceJoin and #DiscoveredServers > 0 then
+        local top = DiscoveredServers[1]
+        if top.Value >= MinValues[Config.MinValueIndex].Val and top.JobId ~= CurrentJobId then
+            TeleportService:TeleportToPlaceInstance(PlaceId, top.JobId, LocalPlayer)
+        end
+    end
+end
+
+-- Hàm nhảy sang Server khác để săn tiếp
+local function HopNextServer()
+    StatusLabel.Text = "Searching new server..."
+    local ok, res = pcall(function()
+        return game:HttpGet("https://games.roblox.com/v1/games/" .. PlaceId .. "/servers/Public?sortOrder=Desc&limit=100")
+    end)
+    if ok and res then
+        local data = HttpService:JSONDecode(res)
+        if data and data.data then
+            for _, srv in ipairs(data.data) do
+                if srv.id ~= CurrentJobId and srv.playing < srv.maxPlayers then
+                    TeleportService:TeleportToPlaceInstance(PlaceId, srv.id, LocalPlayer)
+                    task.wait(5)
+                end
+            end
+        end
+    end
+end
+
+-- Sự kiện các nút bấm
+ForceJoinBtn.MouseButton1Click:Connect(function()
+    Config.ForceJoin = not Config.ForceJoin
+    ForceJoinSub.Text = Config.ForceJoin and "ON" or "OFF"
+    ForceJoinBtn.BackgroundColor3 = Config.ForceJoin and Color3.fromRGB(45, 200, 45) or Color3.fromRGB(65, 125, 55)
+end)
+
+MinValBtn.MouseButton1Click:Connect(function()
+    Config.MinValueIndex = (Config.MinValueIndex % #MinValues) + 1
+    MinValSub.Text = MinValues[Config.MinValueIndex].Label
+    RenderPetList()
+end)
+
+RarityBtn.MouseButton1Click:Connect(function()
+    Config.RarityIndex = (Config.RarityIndex % #Rarities) + 1
+    RaritySub.Text = Rarities[Config.RarityIndex]
+    RenderPetList()
+end)
+
+ScanNowBtn.MouseButton1Click:Connect(function()
+    StatusLabel.Text = "Scanning current server..."
+    RefreshScan()
+    StatusLabel.Text = "Found " .. #DiscoveredServers .. " high-value pets."
+end)
+
+AutoBtn.MouseButton1Click:Connect(function()
+    Config.AutoScanHop = not Config.AutoScanHop
+    AutoBtn.Text = Config.AutoScanHop and "AUTO ON" or "AUTO OFF"
+    AutoBtn.BackgroundColor3 = Config.AutoScanHop and Color3.fromRGB(45, 185, 65) or Color3.fromRGB(90, 98, 110)
+end)
+
+-- Vòng lặp Auto Scan & Server Hop
+task.spawn(function()
+    RefreshScan()
+    while task.wait(4) do
+        if Config.AutoScanHop then
+            RefreshScan()
+            local best = DiscoveredServers[1]
+            local targetVal = MinValues[Config.MinValueIndex].Val
+            if not best or best.Value < targetVal then
+                HopNextServer()
+            else
+                StatusLabel.Text = "Target found in server! Stopping hop."
+            end
+        end
+    end
+end)
